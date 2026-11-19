@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.HaliCam" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">@color/halicam_accent</item>
+        <item name="android:colorPrimary">@color/halicam_bg</item>
+        <item name="android:colorPrimaryDark">#FF000000</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">#FF000000</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+    </style>
+
+    <style name="Theme.HaliCam.Camera">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

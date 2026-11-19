@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lente principal (traseira) + lente menor em laranja (captura frontal simultânea).
+     Tudo dentro da zona segura de 66dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Anel externo da lente principal -->
+    <path android:strokeColor="#FFECECEE" android:strokeWidth="5"
+        android:pathData="M31,58a20,20 0 1,0 40,0a20,20 0 1,0 -40,0z" />
+    <!-- Vidro -->
+    <path android:fillColor="#FF0A0B0D"
+        android:pathData="M37,58a14,14 0 1,0 28,0a14,14 0 1,0 -28,0z" />
+    <!-- Anel interno laranja (identidade HaliCam) -->
+    <path android:strokeColor="#FFFF6A2B" android:strokeWidth="2"
+        android:pathData="M40,58a11,11 0 1,0 22,0a11,11 0 1,0 -22,0z" />
+    <!-- Reflexo -->
+    <path android:fillColor="#FF3A3E46"
+        android:pathData="M43.5,53a3.5,3.5 0 1,0 7,0a3.5,3.5 0 1,0 -7,0z" />
+    <!-- Lente secundária (frontal) -->
+    <path android:fillColor="#FFFF6A2B"
+        android:pathData="M63,37a8,8 0 1,0 16,0a8,8 0 1,0 -16,0z" />
+    <path android:fillColor="#FF141518"
+        android:pathData="M67.5,37a3.5,3.5 0 1,0 7,0a3.5,3.5 0 1,0 -7,0z" />
+</vector>

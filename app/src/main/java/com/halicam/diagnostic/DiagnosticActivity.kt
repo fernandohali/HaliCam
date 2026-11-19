@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Primeiro marco: verificar se frente e traseira conseguem gerar prévias ao mesmo tempo.
  *  Não contém captura de vídeo/áudio nem transmissão para o OBS nesta versão.
  */
-class MainActivity : Activity() {
+class DiagnosticActivity : Activity() {
     private lateinit var manager: CameraManager
     private lateinit var engine: DualCameraProbe
     private lateinit var backView: TextureView

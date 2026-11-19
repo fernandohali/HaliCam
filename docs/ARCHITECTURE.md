@@ -55,3 +55,11 @@ ALL_STATES -> ERROR -> CLEANUP -> IDLE
 - Latência de rede e áudio; utilização do armazenamento.
 - Bateria, estado térmico, espaço livre, bitrate efetivo.
 - Log exportável sem incluir quadros de pessoas nem dados de redes locais.
+
+## Estado da implementação (v0.2, nov/2026)
+
+- **Composição em GPU:** as duas câmeras entram como `SurfaceTexture` (OES) num único renderizador OpenGL ES 2.0 (`gl/Renderer`), que desenha a mesma cena na tela, na superfície de entrada do encoder H.264 e num FBO lido como RGBA para a webcam. A janela PiP (cantos arredondados, círculo e sombra) é feita no shader por SDF; não há cópias de quadro na CPU no caminho de gravação.
+- **Dual aprovado por prova:** `CameraRig` abre traseira e frontal antes de configurar as sessões e só aceita o par após medir quadros das duas por 2 s. No S9+ apenas o par `0+2` passa; o par é memorizado.
+- **Gravação:** `RecordingSession` cria N encoders de vídeo (composição + originais opcionais) e um encoder AAC compartilhado entre todos os `MediaMuxer`. A pausa é feita por relógio (`RecordingClock`), sem cortar trilhas.
+- **Decisão 6 revisada:** a webcam usa por enquanto **MJPEG sobre HTTP** na rede local (compatível com as fontes Navegador e Mídia do OBS, sem receptor dedicado), com token de acesso. WebRTC/USB continuam no roadmap para menor latência e áudio.
+- **Capability-first mantido:** resoluções, FPS, foco/exposição manuais, estabilização, flash, balanço de branco e zoom vêm de `CameraCatalog` + `MediaCodecList`; o que não é anunciado aparece desabilitado com o motivo.
