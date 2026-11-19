@@ -17,6 +17,31 @@ enum class AspectRatio(val label: String, val w: Int, val h: Int) {
     val value: Float get() = w.toFloat() / h
 }
 
+/** Codec de vídeo. HEVC (H.265) guarda mais detalhe no mesmo bitrate. */
+enum class VideoCodec(val label: String, val mime: String, val note: String) {
+    H264("H.264", "video/avc", "Compatível com qualquer player e editor."),
+    HEVC("H.265", "video/hevc", "≈ 40% mais detalhe no mesmo tamanho de arquivo. Alguns editores/PCs antigos não abrem.")
+}
+
+/** Bitrate do vídeo, em bits por pixel por quadro. */
+enum class BitrateLevel(val label: String, val bitsPerPixel: Double) {
+    ECONOMY("Econômico", 0.10), HIGH("Alto", 0.22), MAX("Máximo", 0.36)
+}
+
+/** Perfil de cor aplicado na GPU (prévia e vídeo final, nas duas câmeras). */
+enum class ColorProfile(val label: String, val saturation: Float, val contrast: Float, val note: String) {
+    NATURAL("Natural", 1.00f, 1.00f, "Cores como a câmera entrega."),
+    VIVID("Vívido", 1.22f, 1.08f, "Mais saturação e contraste, pronto para postar."),
+    FLAT("Plano", 0.88f, 0.82f, "Baixo contraste e saturação: preserva sombras e altas luzes para colorir na edição.")
+}
+
+/** Anti-banding: evita faixas/cintilação sob lâmpadas (no Brasil a rede é 60 Hz). */
+enum class Antibanding(val label: String, val mode: Int) {
+    AUTO("Auto", CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO),
+    HZ60("60 Hz", CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_60HZ),
+    HZ50("50 Hz", CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ)
+}
+
 enum class PipShape(val label: String, val aspect: Float, val circle: Boolean) {
     SQUARE("Quadrado", 1f, false), RECT("Retângulo", 0.75f, false), CIRCLE("Círculo", 1f, true)
 }
@@ -29,6 +54,20 @@ enum class AudioQuality(val label: String, val sampleRate: Int, val bitrate: Int
     STANDARD("Padrão · 44,1 kHz · 128 kbps", 44_100, 128_000, false),
     HIGH("Alta · 48 kHz · 192 kbps estéreo", 48_000, 192_000, true),
     MAX("Máxima · 48 kHz · 256 kbps estéreo", 48_000, 256_000, true)
+}
+
+/** Fonte/processamento do microfone (o Android aplica filtros diferentes em cada uma). */
+enum class AudioProcessing(val label: String, val note: String) {
+    CAMERA("Câmera", "Perfil de filmagem do sistema (CAMCORDER): ganho automático e estéreo quando disponível."),
+    VOICE("Voz", "Otimizado para fala: redução de ruído e ganho automático. Bom para narração e ambientes barulhentos."),
+    RAW("Sem filtro", "Sinal bruto do microfone (UNPROCESSED), sem ganho automático nem supressão de ruído. Som mais natural, porém mais baixo.")
+}
+
+/** Direção preferida de captação (Android 10+, depende do suporte do aparelho). */
+enum class MicFocus(val label: String, val note: String) {
+    AUTO("Automático", "O sistema decide a captação."),
+    CAMERA("Câmera", "Capta mais o que a câmera principal está filmando (traseira: à frente; frontal: você)."),
+    AMBIENT("Ambiente", "Captação aberta, para o som do ambiente ao redor.")
 }
 
 /** Configurações de captura persistidas. */
@@ -49,7 +88,15 @@ data class CaptureSettings(
     val mirrorFront: Boolean = true,
     val micDeviceId: Int = 0,            // 0 = microfone padrão
     val audio: AudioQuality = AudioQuality.HIGH,
+    val audioProcessing: AudioProcessing = AudioProcessing.CAMERA,
+    val micFocus: MicFocus = MicFocus.CAMERA,
+    val audioZoom: Boolean = true,       // estreita a captação conforme o zoom do vídeo
     val saveSeparate: Boolean = false,
+    val separateHeight: Int = 1080,      // resolução (lado menor) dos originais separados
+    val codec: VideoCodec = VideoCodec.H264,
+    val bitrate: BitrateLevel = BitrateLevel.HIGH,
+    val colorProfile: ColorProfile = ColorProfile.NATURAL,
+    val antibanding: Antibanding = Antibanding.AUTO,
     val webcamHeight: Int = 720,
     val webcamSource: WebcamSource = WebcamSource.DUAL,
     val showGrid: Boolean = true
@@ -127,7 +174,15 @@ class Prefs(context: Context) {
             mirrorFront = sp.getBoolean("mirror", d.mirrorFront),
             micDeviceId = sp.getInt("mic", d.micDeviceId),
             audio = enumOr(sp.getString("audio", null), d.audio),
+            audioProcessing = enumOr(sp.getString("audioProc", null), d.audioProcessing),
+            micFocus = enumOr(sp.getString("micFocus", null), d.micFocus),
+            audioZoom = sp.getBoolean("audioZoom", d.audioZoom),
             saveSeparate = sp.getBoolean("separate", d.saveSeparate),
+            separateHeight = sp.getInt("separateH", d.separateHeight),
+            codec = enumOr(sp.getString("codec", null), d.codec),
+            bitrate = enumOr(sp.getString("bitrate", null), d.bitrate),
+            colorProfile = enumOr(sp.getString("color", null), d.colorProfile),
+            antibanding = enumOr(sp.getString("antibanding", null), d.antibanding),
             webcamHeight = sp.getInt("webcamH", d.webcamHeight),
             webcamSource = enumOr(sp.getString("webcamSrc", null), d.webcamSource),
             showGrid = sp.getBoolean("grid", d.showGrid)
@@ -141,7 +196,11 @@ class Prefs(context: Context) {
             .putBoolean("me", s.manualExposure).putInt("iso", s.iso).putLong("expNs", s.exposureNs)
             .putInt("aeComp", s.aeCompensation).putInt("awb", s.awbMode).putString("flash", s.flash.name)
             .putBoolean("mirror", s.mirrorFront).putInt("mic", s.micDeviceId).putString("audio", s.audio.name)
+            .putString("audioProc", s.audioProcessing.name)
+            .putString("micFocus", s.micFocus.name).putBoolean("audioZoom", s.audioZoom)
             .putBoolean("separate", s.saveSeparate).putInt("webcamH", s.webcamHeight)
+            .putInt("separateH", s.separateHeight).putString("codec", s.codec.name).putString("bitrate", s.bitrate.name)
+            .putString("color", s.colorProfile.name).putString("antibanding", s.antibanding.name)
             .putString("webcamSrc", s.webcamSource.name).putBoolean("grid", s.showGrid)
             .apply()
     }
@@ -170,6 +229,18 @@ class Prefs(context: Context) {
     var useFront: Boolean
         get() = sp.getBoolean("useFront", false)
         set(v) = sp.edit().putBoolean("useFront", v).apply()
+
+    /** Modo de vídeo (resolução, fps) lembrado separadamente para traseira e frontal no modo VÍDEO. */
+    fun videoMode(front: Boolean): Pair<Int, Int>? {
+        val k = if (front) "vmFront" else "vmBack"
+        val r = sp.getInt("${k}Res", 0)
+        return if (r == 0) null else r to sp.getInt("${k}Fps", 30)
+    }
+
+    fun saveVideoMode(front: Boolean, res: Int, fps: Int) {
+        val k = if (front) "vmFront" else "vmBack"
+        sp.edit().putInt("${k}Res", res).putInt("${k}Fps", fps).apply()
+    }
 
     /** Par traseira/frontal que funcionou em simultâneo, ex.: "0,2". */
     var dualPair: String?

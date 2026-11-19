@@ -1,6 +1,7 @@
 package com.halicam.diagnostic.core
 
 import android.Manifest
+import android.media.MicrophoneDirection
 import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraDevice
@@ -27,6 +28,7 @@ import com.halicam.diagnostic.record.EncoderSupport
 import com.halicam.diagnostic.record.MediaOutput
 import com.halicam.diagnostic.record.RecordingSession
 import com.halicam.diagnostic.record.VideoOutputSpec
+import com.halicam.diagnostic.record.videoBitrate
 import com.halicam.diagnostic.stream.WebcamServer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -157,7 +159,9 @@ class CaptureController(private val context: Context, private val listener: List
             pip = pip,
             frameAspect = frameAspect(),
             mirrorFront = settings.mirrorFront,
-            showGrid = settings.showGrid
+            showGrid = settings.showGrid,
+            saturation = settings.colorProfile.saturation,
+            contrast = settings.colorProfile.contrast
         )
     }
 
@@ -202,14 +206,19 @@ class CaptureController(private val context: Context, private val listener: List
         camerasReady = false
         dualActive = false
         activeCaps = emptyList()
+        normalizeVideoMode()
         val longSide = settings.resolution * 16 / 9
         if (wantsDual() && backIds.isNotEmpty() && frontIds.isNotEmpty()) {
             progress = "Iniciando Dual Capture…"
             val back = catalog.first { it.id == backIds.first() }
             val levels = mutableListOf<Pair<Size, Size>>()
             val b1 = back.streamSize(16f / 9, minOf(longSide, 1920), 1920) ?: Size(1920, 1080)
-            val f1 = catalog.first { it.id == frontIds.last() }.streamSize(16f / 9, 1280, 1280) ?: Size(1280, 720)
-            levels += b1 to f1
+            val front = catalog.first { it.id == frontIds.last() }
+            // Frontal em 1080p primeiro; se o hardware não sustentar as duas, cai para 720p e depois 480p.
+            val fHd = front.streamSize(16f / 9, 1920, 1920)
+            val f720 = front.streamSize(16f / 9, 1280, 1280) ?: Size(1280, 720)
+            if (fHd != null && fHd.width > f720.width) levels += b1 to fHd
+            levels += b1 to f720
             levels += (back.streamSize(16f / 9, 1280, 1280) ?: Size(1280, 720)) to Size(640, 480)
             mainStreamSize = b1
             rig.start(RigRequest(dual = true, pairs = dualPairs(), sizeLevels = levels, params = { c, _ -> paramsFor(c, true) }))
@@ -219,7 +228,7 @@ class CaptureController(private val context: Context, private val listener: List
             val caps = catalog.first { it.id == id }
             val photo = mode == CaptureMode.PHOTO
             val size = if (photo) caps.streamSize(4f / 3, 1440, 1920) else
-                caps.streamSize(16f / 9, longSide, if (settings.resolution >= 2160) 4096 else 1920)
+                caps.streamSize(16f / 9, longSide, if (settings.resolution > 1080) 4096 else 1920)
             val jpeg = if (photo) caps.largestJpeg(4f / 3) else null
             mainStreamSize = size ?: Size(1920, 1080)
             rig.start(RigRequest(dual = false, singleId = id, sizeLevels = listOf(mainStreamSize to mainStreamSize),
@@ -234,7 +243,8 @@ class CaptureController(private val context: Context, private val listener: List
         val fpsRange = caps.fpsRange(s.fps)
         val isMain = if (dualRequest) caps.isBack == pip.backIsMain else true
         val torch = s.flash == FlashMode.ON && caps.hasFlash && mode != CaptureMode.PHOTO
-        if (!isMain) return UnitParams(template = template, fpsRange = fpsRange, torch = torch)
+        val antibanding = s.antibanding.mode
+        if (!isMain) return UnitParams(template = template, fpsRange = fpsRange, torch = torch, antibanding = antibanding)
         return UnitParams(
             template = template,
             fpsRange = fpsRange,
@@ -247,7 +257,8 @@ class CaptureController(private val context: Context, private val listener: List
                     s.exposureNs.coerceIn(caps.exposureRange!!.lower, caps.exposureRange.upper) else null,
             stabilization = s.stabilization,
             torch = torch,
-            photoFlash = s.flash
+            photoFlash = s.flash,
+            antibanding = antibanding
         )
     }
 
@@ -276,7 +287,8 @@ class CaptureController(private val context: Context, private val listener: List
             }
             val m = mainCaps
             val rotated = (m?.sensorOrientation ?: 90) % 180 != 0
-            val sz = if (dual && !pip.backIsMain) Size(1280, 720) else mainStreamSize
+            val sz = if (dual && !pip.backIsMain) units.getOrNull(1)?.bufferSize ?: Size(1280, 720) else mainStreamSize
+            if (dual) frontStreamSize = units.getOrNull(1)?.bufferSize
             mainContentAspect = if (rotated) sz.height.toFloat() / sz.width else sz.width.toFloat() / sz.height
             pushScene()
             applyParams()
@@ -341,6 +353,7 @@ class CaptureController(private val context: Context, private val listener: List
         prefs.mode = m
         dualRetries = 0
         settings = settings.copy(zoom = 1f)
+        if (m == CaptureMode.VIDEO) loadVideoMode()
         pip = pip.clamped(frameAspect())
         pushScene()
         listener.onFrameAspectChanged()
@@ -353,11 +366,14 @@ class CaptureController(private val context: Context, private val listener: List
         val old = settings
         settings = new
         prefs.saveSettings(new)
+        if (mode == CaptureMode.VIDEO && (old.resolution != new.resolution || old.fps != new.fps))
+            prefs.saveVideoMode(useFront, new.resolution, new.fps)
         val reconfigure = old.resolution != new.resolution ||
             (mode == CaptureMode.WEBCAM && old.webcamSource != new.webcamSource)
         if (old.aspect != new.aspect) { pip = pip.clamped(frameAspect()); listener.onFrameAspectChanged() }
         pushScene()
         if (old.webcamHeight != new.webcamHeight) updateWebcamTarget()
+        if (old.micFocus != new.micFocus || old.audioZoom != new.audioZoom) updateMicFocus()
         if (reconfigure && recState == RecState.IDLE) configure() else applyParams()
         listener.onStateChanged()
     }
@@ -368,7 +384,28 @@ class CaptureController(private val context: Context, private val listener: List
         if (v == settings.zoom) return
         settings = settings.copy(zoom = v)
         applyParams()
+        updateMicFocus()
         listener.onStateChanged()
+    }
+
+    /** Aplica direção/zoom do microfone conforme a câmera principal e o zoom atual. */
+    private fun updateMicFocus(): Boolean {
+        val s = session ?: return true
+        val front = mainCaps?.isFront == true
+        val direction = when (settings.micFocus) {
+            MicFocus.AUTO -> MicrophoneDirection.MIC_DIRECTION_UNSPECIFIED
+            MicFocus.CAMERA -> if (front) MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER else MicrophoneDirection.MIC_DIRECTION_AWAY_FROM_USER
+            MicFocus.AMBIENT -> MicrophoneDirection.MIC_DIRECTION_EXTERNAL
+        }
+        val field = when {
+            settings.micFocus == MicFocus.AMBIENT -> -1f
+            settings.audioZoom -> {
+                val max = mainCaps?.maxZoom ?: 1f
+                if (max > 1f) ((settings.zoom - 1f) / (max - 1f)).coerceIn(0f, 1f) else 0f
+            }
+            else -> 0f
+        }
+        return s.setMicFocus(direction, field)
     }
 
     fun setPip(new: PipLayout, persist: Boolean) {
@@ -379,6 +416,7 @@ class CaptureController(private val context: Context, private val listener: List
         if (swapped) {
             settings = settings.copy(zoom = 1f)
             applyParams()
+            updateMicFocus()
             listener.onStateChanged()
         }
     }
@@ -392,6 +430,7 @@ class CaptureController(private val context: Context, private val listener: List
         useFront = !useFront
         prefs.useFront = useFront
         settings = settings.copy(zoom = 1f)
+        if (mode == CaptureMode.VIDEO) loadVideoMode()
         configure()
     }
 
@@ -451,8 +490,21 @@ class CaptureController(private val context: Context, private val listener: List
     /** Bitrate total aproximado (para estimar o tempo restante de armazenamento). */
     fun estimatedBitrate(): Long {
         val (w, h) = outputSize(worldAspect, settings.resolution)
-        return (w.toLong() * h * settings.fps * 0.22).toLong() + settings.audio.bitrate
+        var total = videoBitrate(w, h, settings.fps, settings.bitrate.bitsPerPixel, effectiveCodec().mime).toLong()
+        if (dualActive && settings.saveSeparate) {
+            val (sw, sh) = outputSize(worldAspect, settings.separateHeight)
+            total += 2 * videoBitrate(sw, sh, settings.fps, settings.bitrate.bitsPerPixel, effectiveCodec().mime)
+        }
+        return total + settings.audio.bitrate
     }
+
+    /** Codec escolhido, ou H.264 se o aparelho não tiver encoder HEVC. */
+    fun effectiveCodec(): VideoCodec =
+        if (settings.codec == VideoCodec.HEVC && !EncoderSupport.hasEncoder(VideoCodec.HEVC.mime)) VideoCodec.H264 else settings.codec
+
+    /** Tamanho real do stream da frontal no Dual (1080p, 720p ou 480p conforme o hardware aceitou). */
+    var frontStreamSize: Size? = null
+        private set
 
     fun startRecording() {
         if (!canRecord) return
@@ -461,21 +513,31 @@ class CaptureController(private val context: Context, private val listener: List
         val world = worldAspect
         var res = settings.resolution
         var (w, h) = outputSize(world, res)
-        if (!EncoderSupport.supports(w, h, settings.fps)) {
-            res = 720
+        var codec = effectiveCodec()
+        if (codec != settings.codec) listener.onMessage("Este aparelho não tem encoder H.265; gravando em H.264.")
+        if (codec == VideoCodec.HEVC && !EncoderSupport.supportsAnyOrientation(w, h, settings.fps, codec.mime)) {
+            codec = VideoCodec.H264
+            listener.onMessage("O encoder H.265 não aceita ${res}p a ${settings.fps} fps; gravando em H.264.")
+        }
+        if (!EncoderSupport.supportsAnyOrientation(w, h, settings.fps, codec.mime)) {
+            res = listOf(1080, 720).first { it < settings.resolution || it == 720 }
             val s = outputSize(world, res); w = s.first; h = s.second
-            listener.onMessage("O encoder não aceita ${settings.resolution}p a ${settings.fps} fps nesta proporção; gravando em 720p.")
+            listener.onMessage("O encoder não aceita ${settings.resolution}p a ${settings.fps} fps nesta proporção; gravando em ${res}p.")
         }
         val outputs = mutableListOf(VideoOutputSpec("", SourceMode.COMPOSITE, w, h))
         if (dualActive && settings.saveSeparate) {
-            val (sw, sh) = outputSize(world, 720)
-            outputs += VideoOutputSpec("_traseira", SourceMode.SLOT0, sw, sh)
-            outputs += VideoOutputSpec("_frontal", SourceMode.SLOT1, sw, sh)
+            val (bw, bh) = outputSize(world, minOf(settings.separateHeight, res))
+            outputs += VideoOutputSpec("_traseira", SourceMode.SLOT0, bw, bh)
+            // A frontal não ganha nada acima da resolução do próprio stream.
+            val frontShort = frontStreamSize?.let { minOf(it.width, it.height) } ?: 720
+            val (fw, fh) = outputSize(world, minOf(settings.separateHeight, res, frontShort))
+            outputs += VideoOutputSpec("_frontal", SourceMode.SLOT1, fw, fh)
         }
         val audio = if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
             settings.audio else null
         if (audio == null) listener.onMessage("Sem permissão de microfone: gravando sem áudio.")
-        val s = RecordingSession(context, renderer, outputs, rotation, settings.fps, audio, settings.micDeviceId)
+        val s = RecordingSession(context, renderer, outputs, rotation, settings.fps, codec.mime,
+            settings.bitrate.bitsPerPixel, audio, settings.audioProcessing, settings.micDeviceId)
         try {
             s.start()
         } catch (e: Exception) {
@@ -486,6 +548,8 @@ class CaptureController(private val context: Context, private val listener: List
         }
         s.audioError?.let { listener.onMessage(it) }
         session = s
+        if (audio != null && settings.micFocus != MicFocus.AUTO && !updateMicFocus())
+            listener.onMessage("Este aparelho não aplicou o foco do microfone; usando a captação padrão.")
         recState = RecState.RECORDING
         pushScene()
         listener.onStateChanged()
@@ -593,19 +657,62 @@ class CaptureController(private val context: Context, private val listener: List
 
     // ---------------------------------------------------------------- Opções reais do hardware
 
+    /**
+     * Resoluções (lado menor) oferecidas.
+     * VÍDEO profissional: traseira UHD/QHD/FHD, frontal QHD/FHD. Dual e Webcam: até 1080p.
+     */
     fun resolutionOptions(): List<Int> {
-        val caps = mainCaps ?: return listOf(720, 1080)
-        return listOf(720, 1080, 2160).filter { r ->
+        val caps = mainCaps ?: return listOf(1080)
+        val candidates = when {
+            mode == CaptureMode.VIDEO && caps.isFront -> listOf(1440, 1080)
+            mode == CaptureMode.VIDEO -> listOf(2160, 1440, 1080)
+            else -> listOf(720, 1080)
+        }
+        return candidates.filter { r ->
             val (w, h) = outputSize(worldAspect, r)
-            val allowed = r < 2160 || (mode == CaptureMode.VIDEO)
-            allowed && EncoderSupport.supports(w, h, settings.fps) &&
+            EncoderSupport.supportsAnyOrientation(w, h, 30) &&
                 caps.textureSizes.any { it.width >= r * 16 / 9 && it.height >= r }
         }
     }
 
-    fun fpsOptions(): List<Int> {
+    /** FPS para a resolução [res]. No VÍDEO tudo é 30 fps; 60 só no UHD traseiro, se a câmera anunciar. */
+    fun fpsOptions(res: Int = settings.resolution): List<Int> {
+        if (mode == CaptureMode.VIDEO) {
+            val caps = mainCaps ?: return listOf(30)
+            val list = mutableListOf(30)
+            val (w, h) = outputSize(worldAspect, res)
+            if (!caps.isFront && res == 2160 && caps.supportsFps(60) && EncoderSupport.supportsAnyOrientation(w, h, 60)) list += 60
+            return list
+        }
         val list = activeCaps.ifEmpty { listOfNotNull(mainCaps) }
         return listOf(24, 30, 60).filter { f -> list.isNotEmpty() && list.all { it.supportsFps(f) } }
+    }
+
+    /** Modos de vídeo (resolução, fps) oferecidos no VÍDEO, do maior para o menor. */
+    fun videoModes(): List<Pair<Int, Int>> =
+        resolutionOptions().flatMap { r -> fpsOptions(r).sortedDescending().map { r to it } }
+
+    /** O UHD 60 foi pedido mas a câmera não anuncia 60 fps ao Camera2. */
+    val uhd60Unavailable: Boolean
+        get() = mode == CaptureMode.VIDEO && mainCaps?.isFront == false && 2160 in resolutionOptions() && 60 !in fpsOptions(2160)
+
+    private fun loadVideoMode() {
+        prefs.videoMode(useFront)?.let { (r, f) -> settings = settings.copy(resolution = r, fps = f) }
+    }
+
+    /** Ajusta resolução/fps para valores que a câmera atual oferece no modo atual. */
+    private fun normalizeVideoMode() {
+        if (mode == CaptureMode.PHOTO) return
+        val res = resolutionOptions()
+        if (res.isEmpty()) return
+        val s = settings
+        val r = if (s.resolution in res) s.resolution else res.firstOrNull { it <= s.resolution } ?: res.last()
+        val fps = fpsOptions(r)
+        val f = if (s.fps in fps) s.fps else if (30 in fps) 30 else fps.firstOrNull() ?: s.fps
+        if (r != s.resolution || f != s.fps) {
+            settings = s.copy(resolution = r, fps = f)
+            prefs.saveSettings(settings)
+        }
     }
 
     companion object { private const val TAG = "HaliCam" }

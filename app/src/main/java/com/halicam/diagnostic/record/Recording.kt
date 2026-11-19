@@ -9,6 +9,7 @@ import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
+import com.halicam.diagnostic.core.AudioProcessing
 import com.halicam.diagnostic.core.AudioQuality
 import com.halicam.diagnostic.gl.EncoderTarget
 import com.halicam.diagnostic.gl.Renderer
@@ -90,6 +91,11 @@ object MediaOutput {
     }
 }
 
+/** Bitrate de vídeo (bps) para [bitsPerPixel] bits por pixel por quadro, limitado ao que o encoder aceita. */
+fun videoBitrate(w: Int, h: Int, fps: Int, bitsPerPixel: Double, mime: String): Int =
+    (w.toLong() * h * fps * bitsPerPixel).toLong()
+        .coerceIn(2_000_000L, minOf(100_000_000, EncoderSupport.maxBitrate(mime)).toLong()).toInt()
+
 /** Uma saída de vídeo: composição principal ou original de uma câmera. */
 data class VideoOutputSpec(val label: String, val source: SourceMode, val width: Int, val height: Int)
 
@@ -103,7 +109,10 @@ class RecordingSession(
     private val outputs: List<VideoOutputSpec>,
     private val rotation: Int,
     private val fps: Int,
+    private val videoMime: String,
+    private val bitsPerPixel: Double,
     private val audioQuality: AudioQuality?,
+    private val audioProcessing: AudioProcessing,
     private val micDeviceId: Int
 ) {
     val clock = RecordingClock()
@@ -117,7 +126,7 @@ class RecordingSession(
 
     fun start() {
         val audioEnc = audioQuality?.let {
-            try { AudioEncoder(context, it, micDeviceId, clock) } catch (e: Exception) {
+            try { AudioEncoder(context, it, audioProcessing, micDeviceId, clock) } catch (e: Exception) {
                 audioError = "Áudio indisponível (${e.message}); gravando só vídeo."
                 null
             }
@@ -128,12 +137,17 @@ class RecordingSession(
             for (o in outputs) {
                 val f = MediaOutput.newVideo(context, "HaliCam_${stamp}${o.label}.mp4")
                 files += f
-                val sink = MuxerSink(f.pfd.fileDescriptor, if (audioEnc != null) 2 else 1)
+                // Se o encoder não aceita o quadro em pé (altura > limite), grava deitado e marca a rotação no MP4.
+                val swap = !EncoderSupport.supports(o.width, o.height, fps, videoMime) &&
+                    EncoderSupport.supports(o.height, o.width, fps, videoMime)
+                val ew = if (swap) o.height else o.width
+                val eh = if (swap) o.width else o.height
+                val sink = MuxerSink(f.pfd.fileDescriptor, if (audioEnc != null) 2 else 1, if (swap) 270 else 0)
                 sinks += sink
-                val bitrate = (o.width.toLong() * o.height * fps * 0.22).toInt().coerceIn(2_000_000, 50_000_000)
-                val enc = VideoEncoder(o.width, o.height, fps, bitrate, sink)
+                val enc = VideoEncoder(ew, eh, fps, videoBitrate(ew, eh, fps, bitsPerPixel, videoMime), videoMime, sink)
                 encoders += enc
-                targets += EncoderTarget(enc.inputSurface, o.width, o.height, rotation, o.source) { clock.pts() }
+                val rot = (rotation + if (swap) 90 else 0) % 360
+                targets += EncoderTarget(enc.inputSurface, ew, eh, rot, o.source) { clock.pts() }
             }
             audioEnc?.attach(sinks.toList())
             clock.start()
@@ -144,6 +158,9 @@ class RecordingSession(
             throw e
         }
     }
+
+    /** Ajusta direção/zoom do microfone durante a gravação. Retorna false se o aparelho recusou. */
+    fun setMicFocus(direction: Int, field: Float): Boolean = audio?.setMicFocus(direction, field) ?: true
 
     fun pause() = clock.pause()
     fun resume() = clock.resume()

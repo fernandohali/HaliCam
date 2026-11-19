@@ -33,11 +33,18 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.halicam.diagnostic.DiagnosticActivity
 import com.halicam.diagnostic.core.AspectRatio
+import com.halicam.diagnostic.core.AudioProcessing
 import com.halicam.diagnostic.core.AudioQuality
+import com.halicam.diagnostic.core.Antibanding
+import com.halicam.diagnostic.core.BitrateLevel
+import com.halicam.diagnostic.core.ColorProfile
+import com.halicam.diagnostic.core.VideoCodec
+import com.halicam.diagnostic.core.MicFocus
 import com.halicam.diagnostic.core.CaptureController
 import com.halicam.diagnostic.core.CaptureMode
 import com.halicam.diagnostic.core.CaptureSettings
@@ -48,6 +55,7 @@ import com.halicam.diagnostic.core.PipShape
 import com.halicam.diagnostic.core.RecState
 import com.halicam.diagnostic.core.WebcamSource
 import com.halicam.diagnostic.record.AudioEncoder
+import com.halicam.diagnostic.record.EncoderSupport
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.exp
@@ -147,6 +155,7 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
     }
 
     override fun onPause() {
+        cameraPopup?.dismiss()
         super.onPause()
         controller.pause()
         orientationListener?.disable()
@@ -200,8 +209,8 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
             background = pill(Palette.CHIP, dp(100f).toFloat())
             setPadding(dp(6f), 0, dp(6f), 0)
         }
-        resChip = chipText().apply { setOnClickListener { cycleResolution() } }
-        fpsChip = chipText().apply { setOnClickListener { cycleFps() } }
+        resChip = chipText().apply { setOnClickListener { showCameraSelect() } }
+        fpsChip = chipText().apply { setOnClickListener { showCameraSelect() } }
         aspectChip = chipText().apply { setOnClickListener { cycleAspect() } }
         formatChip.addView(resChip); formatChip.addView(fpsChip); formatChip.addView(aspectChip)
         top.addView(formatChip, FrameLayout.LayoutParams(-2, dp(40f), Gravity.START or Gravity.TOP))
@@ -424,7 +433,7 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
         } else {
             resChip.text = resLabel(s.resolution)
             fpsChip.visibility = View.VISIBLE
-            fpsChip.text = "${s.fps} FPS"
+            fpsChip.text = "${s.fps} FPS ▾"
             aspectChip.text = c.worldAspect.label
         }
         resChip.alpha = if (idle) 1f else 0.5f
@@ -502,7 +511,7 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
     private fun zoomLabel(z: Float): String =
         if (abs(z - z.roundToInt()) < 0.05f) "${z.roundToInt()}×" else String.format(Locale("pt", "BR"), "%.1f×", z)
 
-    private fun resLabel(r: Int) = when (r) { 2160 -> "4K"; 1080 -> "1080p"; 720 -> "720p"; else -> "${r}p" }
+    private fun resLabel(r: Int) = when (r) { 2160 -> "UHD"; 1440 -> "QHD"; 1080 -> "FHD"; 720 -> "HD"; else -> "${r}p" }
 
     /** Atualizações periódicas: cronômetro, bateria, armazenamento, temperatura e FPS medido. */
     private val ticker = object : Runnable {
@@ -562,23 +571,89 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
         showBanner("Flash: ${next.label.lowercase()}${if (c.mode != CaptureMode.PHOTO && next == FlashMode.ON) " (lanterna)" else ""}")
     }
 
-    private fun cycleResolution() {
-        val c = controller
-        if (c.recState != RecState.IDLE || c.mode == CaptureMode.PHOTO) return
-        val opts = c.resolutionOptions()
-        if (opts.isEmpty()) return
-        val next = opts[(opts.indexOf(c.settings.resolution) + 1) % opts.size]
-        c.updateSettings(c.settings.copy(resolution = next))
-    }
+    private var cameraPopup: PopupWindow? = null
 
-    private fun cycleFps() {
+    /** Select da barra superior: escolha da câmera (no VÍDEO) e do modo resolução/fps. */
+    private fun showCameraSelect() {
         val c = controller
-        if (c.recState != RecState.IDLE || c.mode == CaptureMode.PHOTO) return
-        val opts = c.fpsOptions()
-        if (opts.isEmpty()) return
-        val next = opts[(opts.indexOf(c.settings.fps) + 1) % opts.size]
-        c.updateSettings(c.settings.copy(fps = next))
-        if (opts.size == 1) showBanner("Este aparelho só anuncia ${opts[0]} fps para esta câmera.")
+        if (c.mode == CaptureMode.PHOTO) return
+        if (c.recState != RecState.IDLE) { showBanner("Pare a gravação para trocar a câmera ou o modo."); return }
+        cameraPopup?.dismiss()
+
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = pill(Palette.PANEL, dp(18f).toFloat(), Palette.DIVIDER, dp(1f))
+            setPadding(dp(6f), dp(8f), dp(6f), dp(8f))
+            elevation = dp(8f).toFloat()
+        }
+        val popup = PopupWindow(list, dp(250f), ViewGroup.LayoutParams.WRAP_CONTENT, true).apply {
+            setBackgroundDrawable(GradientDrawable().apply { setColor(Color.TRANSPARENT) })
+            isOutsideTouchable = true
+            elevation = dp(8f).toFloat()
+            setOnDismissListener { cameraPopup = null }
+        }
+
+        fun header(text: String) = list.addView(TextView(this).apply {
+            this.text = text.uppercase(Locale("pt", "BR"))
+            textSize = 11f
+            letterSpacing = 0.08f
+            setTextColor(Palette.ACCENT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(12f), dp(8f), dp(12f), dp(4f))
+        })
+
+        fun option(title: String, subtitle: String?, selected: Boolean, onClick: () -> Unit) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+                background = if (selected) pill(0xFF2C2C2E.toInt(), dp(12f).toFloat()) else null
+                isClickable = true
+                setOnClickListener { popup.dismiss(); if (!selected) onClick() }
+            }
+            val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            texts.addView(TextView(this).apply {
+                text = title
+                textSize = 15f
+                setTextColor(if (selected) Palette.ACCENT else Palette.TEXT)
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            })
+            subtitle?.let {
+                texts.addView(TextView(this).apply { text = it; textSize = 12f; setTextColor(Palette.MUTED) })
+            }
+            row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+            if (selected) row.addView(TextView(this).apply { text = "✓"; textSize = 16f; setTextColor(Palette.ACCENT) })
+            list.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+
+        val s = c.settings
+        val front = c.mainCaps?.isFront == true
+        if (c.mode == CaptureMode.VIDEO) {
+            header("Câmera")
+            option("Traseira", "UHD · QHD · FHD", !front) { c.flipCamera() }
+            option("Frontal", "QHD · FHD", front) { c.flipCamera() }
+        }
+
+        val sizes = mapOf(2160 to "3840×2160", 1440 to "2560×1440", 1080 to "1920×1080", 720 to "1280×720")
+        val modes = if (c.mode == CaptureMode.VIDEO) c.videoModes()
+            else c.resolutionOptions().flatMap { r -> c.fpsOptions().map { r to it } }
+        header(if (c.mode == CaptureMode.VIDEO) "Modo de vídeo" else "Resolução (${c.mode.label.lowercase().replaceFirstChar { it.uppercase() }})")
+        for ((r, f) in modes) {
+            option("${resLabel(r)} $f fps", sizes[r] ?: "${r}p", r == s.resolution && f == s.fps) {
+                c.updateSettings(c.settings.copy(resolution = r, fps = f))
+            }
+        }
+        if (c.uhd60Unavailable) {
+            list.addView(TextView(this).apply {
+                text = "UHD 60 fps indisponível neste aparelho (a câmera só anuncia até 30 fps para apps de terceiros)."
+                textSize = 11.5f
+                setTextColor(Palette.MUTED)
+                setPadding(dp(12f), dp(8f), dp(12f), dp(4f))
+            })
+        }
+
+        cameraPopup = popup
+        popup.showAsDropDown(formatChip, 0, dp(8f))
     }
 
     private fun cycleAspect() {
@@ -685,15 +760,29 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
 
         if (c.mode != CaptureMode.PHOTO) {
             sh.section("Vídeo")
-            val res = c.resolutionOptions()
-            sh.segmented("Resolução", res.map(::resLabel), res.indexOf(s.resolution), enabled = idle,
-                note = if (c.mode == CaptureMode.DUAL) "No Dual o limite é 1080p (duas câmeras + composição em tempo real)." else null) {
-                set(s.copy(resolution = res[it]))
-            }
-            val fps = c.fpsOptions()
-            sh.segmented("Quadros por segundo", fps.map { "$it fps" }, fps.indexOf(s.fps), enabled = idle,
-                note = if (60 !in fps) "60 fps não é oferecido: a câmera não anuncia essa faixa para o Camera2 neste aparelho." else null) {
-                set(s.copy(fps = fps[it]))
+            if (c.mode == CaptureMode.VIDEO) {
+                val modes = c.videoModes()
+                val sizes = mapOf(2160 to "3840×2160", 1440 to "2560×1440", 1080 to "1920×1080")
+                val cur = modes.firstOrNull { it.first == s.resolution && it.second == s.fps }
+                val note = buildString {
+                    append(if (caps?.isFront == true) "Câmera frontal" else "Câmera traseira")
+                    cur?.let { append(" · ${sizes[it.first] ?: "${it.first}p"} a ${it.second} fps") }
+                    if (c.uhd60Unavailable) append("\nUHD 60 fps indisponível: a câmera traseira deste aparelho só anuncia até 30 fps " +
+                        "para apps de terceiros (o 4K60 do app da Samsung usa uma API privada).")
+                }
+                sh.segmented("Modo de vídeo", modes.map { "${resLabel(it.first)} ${it.second}" }, modes.indexOf(cur), enabled = idle, note = note) {
+                    set(s.copy(resolution = modes[it].first, fps = modes[it].second))
+                }
+            } else {
+                val res = c.resolutionOptions()
+                sh.segmented("Resolução", res.map(::resLabel), res.indexOf(s.resolution), enabled = idle,
+                    note = if (c.mode == CaptureMode.DUAL) "No Dual o limite é FHD (duas câmeras + composição em tempo real)." else null) {
+                    set(s.copy(resolution = res[it]))
+                }
+                val fps = c.fpsOptions()
+                sh.segmented("Quadros por segundo", fps.map { "$it fps" }, fps.indexOf(s.fps), enabled = idle) {
+                    set(s.copy(fps = fps[it]))
+                }
             }
             if (c.mode == CaptureMode.VIDEO || c.mode == CaptureMode.DUAL) {
                 val aspects = listOf(AspectRatio.R9_16, AspectRatio.R16_9, AspectRatio.R1_1)
@@ -712,6 +801,28 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
             sh.toggle("Estabilização", s.stabilization && caps?.hasStabilization == true, enabled = caps?.hasStabilization == true, note = stabNote) {
                 set(s.copy(stabilization = it))
             }
+
+            sh.section("Qualidade do arquivo")
+            val hevc = EncoderSupport.hasEncoder(VideoCodec.HEVC.mime)
+            sh.segmented("Codec", VideoCodec.values().map { it.label }, c.effectiveCodec().ordinal, enabled = idle && hevc,
+                note = if (hevc) s.codec.note else "Este aparelho não tem encoder H.265.") {
+                set(s.copy(codec = VideoCodec.values()[it]))
+            }
+            val mbps = c.estimatedBitrate() / 1_000_000.0
+            sh.segmented("Bitrate", BitrateLevel.values().map { it.label }, s.bitrate.ordinal, enabled = idle,
+                note = String.format(Locale("pt", "BR"), "≈ %.0f Mbps no total · ≈ %.0f MB por minuto de gravação.", mbps, mbps * 60 / 8)) {
+                set(s.copy(bitrate = BitrateLevel.values()[it]))
+            }
+        }
+
+        sh.section("Cor e imagem")
+        sh.segmented("Perfil de cor", ColorProfile.values().map { it.label }, s.colorProfile.ordinal,
+            note = s.colorProfile.note + if (c.mode == CaptureMode.PHOTO) " (Vale para vídeo e webcam; fotos saem como a câmera entrega.)" else "") {
+            set(s.copy(colorProfile = ColorProfile.values()[it]))
+        }
+        sh.segmented("Anti-cintilação", Antibanding.values().map { it.label }, s.antibanding.ordinal,
+            note = "Remove faixas e piscadas sob lâmpadas. No Brasil a rede elétrica é 60 Hz. Não se aplica com exposição manual.") {
+            set(s.copy(antibanding = Antibanding.values()[it]))
         }
         sh.toggle("Grade de composição", s.showGrid, note = "Só na prévia; não aparece no vídeo.") { set(s.copy(showGrid = it)) }
 
@@ -773,24 +884,43 @@ class CameraActivity : Activity(), CaptureController.Listener, PipOverlayView.Ca
 
         sh.section("Dual Capture")
         sh.info(when (c.dualAvailable) {
-            true -> "Disponível neste aparelho (par ${c.prefs.dualPair?.replace(",", " + ") ?: "—"}). Traseira e frontal capturam ao mesmo tempo e são compostas em um único MP4."
+            true -> "Disponível neste aparelho (par ${c.prefs.dualPair?.replace(",", " + ") ?: "—"}). Traseira e frontal capturam ao mesmo tempo e são compostas em um único MP4." +
+                (c.frontStreamSize?.let { "\nFrontal capturando em ${it.width}x${it.height}." } ?: "")
             false -> "Indisponível: ${c.dualFailure ?: "o aparelho não manteve as duas câmeras ativas."}"
             null -> "Ainda não testado. Entre no modo DUAL para verificar."
         })
         sh.toggle("Espelhar câmera frontal", s.mirrorFront) { set(s.copy(mirrorFront = it)) }
         sh.toggle("Salvar originais separados", s.saveSeparate, enabled = idle,
-            note = "Além da composição, grava traseira e frontal em arquivos próprios (720p). Aumenta o consumo e o aquecimento.") {
+            note = "Além da composição, grava traseira e frontal em arquivos próprios. Aumenta o consumo e o aquecimento.") {
             set(s.copy(saveSeparate = it))
+        }
+        if (s.saveSeparate) {
+            val sepRes = listOf(720, 1080)
+            sh.segmented("Resolução dos originais", sepRes.map { "${it}p" }, sepRes.indexOf(s.separateHeight).coerceAtLeast(0), enabled = idle,
+                note = "A frontal fica limitada à resolução que o hardware entrega no Dual.") {
+                set(s.copy(separateHeight = sepRes[it]))
+            }
         }
         sh.action("Opções da janela frontal") { showPipSheet() }
 
         sh.section("Áudio")
-        val mics = AudioEncoder.inputDevices(this).filter { it.type != android.media.AudioDeviceInfo.TYPE_TELEPHONY }
+        val mics = AudioEncoder.inputDevices(this)
         val micIds = listOf(0) + mics.map { it.id }
         sh.segmented("Microfone", listOf("Padrão") + mics.map(AudioEncoder::deviceLabel),
             micIds.indexOf(s.micDeviceId).coerceAtLeast(0), enabled = idle) { set(s.copy(micDeviceId = micIds[it])) }
         sh.segmented("Qualidade de áudio", listOf("Padrão", "Alta", "Máxima"), s.audio.ordinal, enabled = idle, note = s.audio.label) {
             set(s.copy(audio = AudioQuality.values()[it]))
+        }
+        sh.segmented("Processamento do microfone", AudioProcessing.values().map { it.label }, s.audioProcessing.ordinal,
+            enabled = idle, note = s.audioProcessing.note) {
+            set(s.copy(audioProcessing = AudioProcessing.values()[it]))
+        }
+        sh.segmented("Foco do microfone", MicFocus.values().map { it.label }, s.micFocus.ordinal, note = s.micFocus.note) {
+            set(s.copy(micFocus = MicFocus.values()[it]))
+        }
+        sh.toggle("Zoom de áudio", s.audioZoom,
+            note = "Ao dar zoom no vídeo, o microfone estreita a captação para o que está sendo filmado (Android 10+, se o aparelho suportar).") {
+            set(s.copy(audioZoom = it))
         }
 
         sh.section("Webcam (OBS Studio)")

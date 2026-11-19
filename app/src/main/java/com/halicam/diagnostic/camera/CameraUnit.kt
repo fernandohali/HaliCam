@@ -35,7 +35,8 @@ data class UnitParams(
     val stabilization: Boolean = false,
     val torch: Boolean = false,
     val photoFlash: com.halicam.diagnostic.core.FlashMode = com.halicam.diagnostic.core.FlashMode.OFF,
-    val meteringPoint: Pair<Float, Float>? = null   // ponto normalizado no sensor (0..1)
+    val meteringPoint: Pair<Float, Float>? = null,  // ponto normalizado no sensor (0..1)
+    val antibanding: Int = CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO
 )
 
 /** Uma câmera física aberta via Camera2. Todos os métodos devem rodar na thread de [handler]. */
@@ -54,6 +55,8 @@ class CameraUnit(
     private var opening = false
     var params = UnitParams()
         private set
+    /** Tamanho do stream entregue ao renderizador (definido pelo CameraRig). */
+    var bufferSize: Size = Size(1920, 1080)
 
     val isOpen: Boolean get() = device != null && !closed
 
@@ -199,6 +202,7 @@ class CameraUnit(
             b.set(CaptureRequest.CONTROL_AE_MODE, aeMode)
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
                 p.aeCompensation.coerceIn(caps.aeCompRange.lower, caps.aeCompRange.upper))
+            if (caps.antibandingModes.contains(p.antibanding)) b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, p.antibanding)
         }
         val torch = p.torch && caps.hasFlash && p.template != CameraDevice.TEMPLATE_PREVIEW
         b.set(CaptureRequest.FLASH_MODE, if (torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)

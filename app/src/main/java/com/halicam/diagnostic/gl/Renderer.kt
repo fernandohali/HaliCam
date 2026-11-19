@@ -30,7 +30,9 @@ data class Scene(
     val pip: PipLayout = PipLayout(),
     val frameAspect: Float = 9f / 16f,   // largura/altura do quadro em espaço de tela
     val mirrorFront: Boolean = true,
-    val showGrid: Boolean = false
+    val showGrid: Boolean = false,
+    val saturation: Float = 1f,          // perfil de cor (1 = original)
+    val contrast: Float = 1f
 ) {
     /** Slot que ocupa o fundo: 0 = traseira, 1 = frontal (no modo dual). */
     val mainSlot: Int get() = if (dual && !pip.backIsMain) 1 else 0
@@ -80,7 +82,7 @@ class Renderer : SlotProvider, SurfaceTexture.OnFrameAvailableListener {
     private var aPos = 0
     private var uRect = 0; private var uRowX = 0; private var uRowY = 0; private var uUv = 0
     private var uTexMatrix = 0; private var uSizePx = 0; private var uRadius = 0; private var uMode = 0
-    private var uSoft = 0; private var uAlpha = 0; private var uColor = 0
+    private var uSoft = 0; private var uAlpha = 0; private var uColor = 0; private var uSat = 0; private var uContrast = 0
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         .apply { put(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)); position(0) }
     private val identity = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
@@ -127,6 +129,8 @@ class Renderer : SlotProvider, SurfaceTexture.OnFrameAvailableListener {
         uSoft = GLES20.glGetUniformLocation(program, "uSoft")
         uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
         uColor = GLES20.glGetUniformLocation(program, "uColor")
+        uSat = GLES20.glGetUniformLocation(program, "uSat")
+        uContrast = GLES20.glGetUniformLocation(program, "uContrast")
     }
 
     // ---------------------------------------------------------------- SlotProvider
@@ -316,6 +320,8 @@ class Renderer : SlotProvider, SurfaceTexture.OnFrameAvailableListener {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
+        GLES20.glUniform1f(uSat, sc.saturation)
+        GLES20.glUniform1f(uContrast, sc.contrast)
         GLES20.glEnable(GLES20.GL_BLEND)
         // Mistura só a cor; o alfa do destino fica em 1 (a tela não pode ficar translúcida).
         GLES20.glBlendFuncSeparate(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA, GLES20.GL_ZERO, GLES20.GL_ONE)
@@ -492,6 +498,8 @@ uniform float uMode;
 uniform float uSoft;
 uniform float uAlpha;
 uniform vec4 uColor;
+uniform float uSat;
+uniform float uContrast;
 varying vec2 vTex;
 varying vec2 vLocal;
 float sdRoundRect(vec2 p, vec2 halfSize, float r) {
@@ -512,7 +520,10 @@ void main() {
             float d = sdRoundRect(vLocal, uSizePx * 0.5, uRadius);
             a = 1.0 - smoothstep(-1.0, 1.0, d);
         }
-        gl_FragColor = vec4(c.rgb, a * uAlpha);
+        vec3 rgb = (c.rgb - 0.5) * uContrast + 0.5;
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        rgb = clamp(mix(vec3(luma), rgb, uSat), 0.0, 1.0);
+        gl_FragColor = vec4(rgb, a * uAlpha);
     }
 }
 """

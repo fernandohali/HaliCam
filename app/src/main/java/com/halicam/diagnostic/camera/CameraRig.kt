@@ -84,6 +84,7 @@ class CameraRig(
             val st = slots.newSlots()
             st[0].setDefaultBufferSize(size.width, size.height)
             slots.setSlotInfo(0, size, c)
+            unit.bufferSize = size
             val surface = Surface(st[0]).also(surfaces::add)
             unit.startSession(surface, req.jpegSize, req.params(c, true), onReady = {
                 if (gen != generation) return@startSession
@@ -157,6 +158,8 @@ class CameraRig(
         st[1].setDefaultBufferSize(frontSize.width, frontSize.height)
         slots.setSlotInfo(0, backSize, back.caps)
         slots.setSlotInfo(1, frontSize, front.caps)
+        back.bufferSize = backSize
+        front.bufferSize = frontSize
         val s0 = Surface(st[0]).also(surfaces::add)
         val s1 = Surface(st[1]).also(surfaces::add)
         var ready = 0

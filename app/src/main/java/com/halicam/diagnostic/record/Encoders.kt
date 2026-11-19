@@ -12,8 +12,13 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
+import android.os.Build
+import android.media.audiofx.AudioEffect
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import android.view.Surface
+import com.halicam.diagnostic.core.AudioProcessing
 import com.halicam.diagnostic.core.AudioQuality
 import java.io.FileDescriptor
 import java.nio.ByteBuffer
@@ -45,10 +50,12 @@ class RecordingClock {
 }
 
 /** MediaMuxer que só inicia quando todas as trilhas esperadas foram adicionadas. */
-class MuxerSink(fd: FileDescriptor, private val expectedTracks: Int) {
+class MuxerSink(fd: FileDescriptor, private val expectedTracks: Int, orientationHint: Int = 0) {
     private class Pending(val track: Int, val data: ByteArray, val info: MediaCodec.BufferInfo)
 
-    private val muxer = MediaMuxer(fd, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    private val muxer = MediaMuxer(fd, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).apply {
+        if (orientationHint != 0) setOrientationHint(orientationHint)
+    }
     private var added = 0
     private var started = false
     private var stopped = false
@@ -97,46 +104,67 @@ class MuxerSink(fd: FileDescriptor, private val expectedTracks: Int) {
 }
 
 object EncoderSupport {
-    private val avcCaps: MediaCodecInfo.CodecCapabilities? by lazy {
+    private val capsCache = HashMap<String, MediaCodecInfo.CodecCapabilities?>()
+
+    /** Capacidades do encoder preferido (hardware antes de software) para [mime]. */
+    @Synchronized
+    private fun caps(mime: String): MediaCodecInfo.CodecCapabilities? = capsCache.getOrPut(mime) {
         MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
-            .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
+            .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, true) } }
             .sortedBy { if (it.name.startsWith("OMX.google") || it.name.startsWith("c2.android")) 1 else 0 }
-            .firstOrNull()?.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            .firstOrNull()?.getCapabilitiesForType(mime)
     }
 
-    fun supports(w: Int, h: Int, fps: Int): Boolean =
-        avcCaps?.videoCapabilities?.areSizeAndRateSupported(w, h, fps.toDouble()) ?: false
+    fun hasEncoder(mime: String): Boolean = caps(mime) != null
 
-    fun supportsHighProfile(): Boolean =
-        avcCaps?.profileLevels?.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh } ?: false
+    fun supports(w: Int, h: Int, fps: Int, mime: String = MediaFormat.MIMETYPE_VIDEO_AVC): Boolean =
+        caps(mime)?.videoCapabilities?.areSizeAndRateSupported(w, h, fps.toDouble()) ?: false
+
+    /**
+     * Aceita [w]x[h] diretamente ou deitado (gravado como [h]x[w] + rotação no MP4).
+     * Encoders costumam limitar a altura (ex.: 4096x2304), o que barra 2160x3840 em pé.
+     */
+    fun supportsAnyOrientation(w: Int, h: Int, fps: Int, mime: String = MediaFormat.MIMETYPE_VIDEO_AVC): Boolean =
+        supports(w, h, fps, mime) || supports(h, w, fps, mime)
+
+    fun maxBitrate(mime: String): Int = caps(mime)?.videoCapabilities?.bitrateRange?.upper ?: 50_000_000
+
+    fun supportsProfile(mime: String, profile: Int): Boolean =
+        caps(mime)?.profileLevels?.any { it.profile == profile } ?: false
 }
 
-/** Encoder H.264 com superfície de entrada (alimentada pelo renderizador OpenGL). */
-class VideoEncoder(val width: Int, val height: Int, fps: Int, bitrate: Int, private val sink: MuxerSink) {
-    private val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+/** Encoder de vídeo (H.264 ou H.265) com superfície de entrada (alimentada pelo renderizador OpenGL). */
+class VideoEncoder(val width: Int, val height: Int, fps: Int, bitrate: Int, mime: String, private val sink: MuxerSink) {
+    private val codec = MediaCodec.createEncoderByType(mime)
     val inputSurface: Surface
     private val drainThread: Thread
     @Volatile private var track = -1
 
     init {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
         }
+        // Perfil preferido: H.264 High / HEVC Main; se o encoder recusar, usa o padrão dele.
+        val profile = when (mime) {
+            MediaFormat.MIMETYPE_VIDEO_AVC -> MediaCodecInfo.CodecProfileLevel.AVCProfileHigh to MediaCodecInfo.CodecProfileLevel.AVCLevel51
+            MediaFormat.MIMETYPE_VIDEO_HEVC -> MediaCodecInfo.CodecProfileLevel.HEVCProfileMain to MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
+            else -> null
+        }
         var configured = false
-        if (EncoderSupport.supportsHighProfile()) {
+        if (profile != null && EncoderSupport.supportsProfile(mime, profile.first)) {
             try {
-                val high = MediaFormat(format).apply {
-                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
-                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+                val p = MediaFormat(format).apply {
+                    setInteger(MediaFormat.KEY_PROFILE, profile.first)
+                    setInteger(MediaFormat.KEY_LEVEL, profile.second)
                 }
-                codec.configure(high, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                codec.configure(p, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 configured = true
             } catch (e: Exception) {
-                Log.w(TAG, "H.264 High indisponível, usando perfil padrão: ${e.message}")
+                Log.w(TAG, "Perfil ${profile.first} indisponível em $mime, usando o padrão: ${e.message}")
                 codec.reset()
             }
         }
@@ -175,10 +203,19 @@ class VideoEncoder(val width: Int, val height: Int, fps: Int, bitrate: Int, priv
     }
 }
 
-/** Captura AudioRecord → AAC, distribuindo as amostras para um ou mais arquivos. */
+/**
+ * Captura AudioRecord → AAC, distribuindo as amostras para um ou mais arquivos.
+ *
+ * - Leitura do microfone e saída do codec em threads separadas: escrita em disco (até 3 arquivos
+ *   no Dual Capture) nunca atrasa a leitura, evitando estouro do buffer do AudioRecord (cortes/estalos).
+ * - Nenhuma amostra PCM é descartada: espera buffer livre no codec e divide blocos grandes.
+ * - Timestamps derivados da contagem de amostras (sem jitter), reancorados no relógio após pausa
+ *   ou se houver deriva real (perda de dados no driver).
+ */
 class AudioEncoder(
     context: Context,
     private val quality: AudioQuality,
+    processing: AudioProcessing,
     micDeviceId: Int,
     private val clock: RecordingClock
 ) {
@@ -188,16 +225,19 @@ class AudioEncoder(
     private val channels: Int
     private var tracks = IntArray(0)
     @Volatile private var running = true
-    private val thread: Thread
+    private val captureThread: Thread
+    private val drainThread: Thread
+    private val effects = mutableListOf<AudioEffect>()
 
     init {
-        val (rec, ch) = createRecord(quality)
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val (rec, ch) = createRecord(quality, sourceFor(processing, am))
         record = rec
         channels = ch
         if (micDeviceId != 0) {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == micDeviceId }?.let { record.preferredDevice = it }
         }
+        if (processing == AudioProcessing.VOICE) attachVoiceEffects(record.audioSessionId)
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, quality.sampleRate, channels).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, quality.bitrate)
@@ -206,19 +246,38 @@ class AudioEncoder(
         codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         codec.start()
-        thread = Thread(::loop, "HaliCam-Audio")
+        captureThread = Thread(::captureLoop, "HaliCam-AudioIn").apply { priority = Thread.MAX_PRIORITY }
+        drainThread = Thread(::drainLoop, "HaliCam-AudioOut")
+    }
+
+    private fun sourceFor(p: AudioProcessing, am: AudioManager): Int = when (p) {
+        AudioProcessing.CAMERA -> MediaRecorder.AudioSource.CAMCORDER
+        AudioProcessing.VOICE -> MediaRecorder.AudioSource.MIC
+        AudioProcessing.RAW ->
+            if (am.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true")
+                MediaRecorder.AudioSource.UNPROCESSED
+            else MediaRecorder.AudioSource.VOICE_RECOGNITION   // o mais "cru" garantido pelo CDD
+    }
+
+    private fun attachVoiceEffects(session: Int) {
+        if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(session)?.let { it.enabled = true; effects += it }
+        if (AutomaticGainControl.isAvailable()) AutomaticGainControl.create(session)?.let { it.enabled = true; effects += it }
     }
 
     @SuppressLint("MissingPermission")
-    private fun createRecord(q: AudioQuality): Pair<AudioRecord, Int> {
+    private fun createRecord(q: AudioQuality, source: Int): Pair<AudioRecord, Int> {
         val attempts = if (q.stereo) listOf(2, 1) else listOf(1)
-        for (ch in attempts) {
-            val mask = if (ch == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
-            val min = AudioRecord.getMinBufferSize(q.sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT)
-            if (min <= 0) continue
-            val r = AudioRecord(MediaRecorder.AudioSource.CAMCORDER, q.sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT, max(min * 4, 16384))
-            if (r.state == AudioRecord.STATE_INITIALIZED) return r to ch
-            r.release()
+        for (src in listOf(source, MediaRecorder.AudioSource.MIC).distinct()) {
+            for (ch in attempts) {
+                val mask = if (ch == 2) AudioFormat.CHANNEL_IN_STEREO else AudioFormat.CHANNEL_IN_MONO
+                val min = AudioRecord.getMinBufferSize(q.sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT)
+                if (min <= 0) continue
+                // ~0,5 s de folga: absorve picos de CPU/disco sem perder amostras
+                val size = max(min * 4, q.sampleRate * ch * 2 / 2)
+                val r = try { AudioRecord(src, q.sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT, size) } catch (_: Exception) { continue }
+                if (r.state == AudioRecord.STATE_INITIALIZED) return r to ch
+                r.release()
+            }
         }
         throw IllegalStateException("AudioRecord indisponível")
     }
@@ -231,42 +290,66 @@ class AudioEncoder(
 
     fun start() {
         record.startRecording()
-        thread.start()
+        drainThread.start()
+        captureThread.start()
     }
 
-    private fun loop() {
+    private fun captureLoop() {
         val bytesPerFrame = 2 * channels
-        val chunk = ByteArray(2048 * channels)
-        val info = MediaCodec.BufferInfo()
+        val chunk = ByteArray(1024 * bytesPerFrame)   // 1024 quadros = 1 quadro AAC
+        var anchorUs = -1L        // pts do início do trecho contínuo atual
+        var framesSinceAnchor = 0L
         var lastPtsUs = -1L
         while (running) {
             val n = record.read(chunk, 0, chunk.size)
-            if (n <= 0) continue
+            if (n <= 0) { if (n < 0) Log.w(TAG, "AudioRecord.read: $n"); continue }
+            val frames = n / bytesPerFrame
             val readEnd = System.nanoTime()
-            val durationNs = n.toLong() / bytesPerFrame * 1_000_000_000L / quality.sampleRate
-            val pts = clock.pts(readEnd - durationNs) ?: continue   // pausado: descarta
-            var ptsUs = pts / 1000
-            if (ptsUs <= lastPtsUs) ptsUs = lastPtsUs + 1
-            lastPtsUs = ptsUs
-            val inIdx = codec.dequeueInputBuffer(10_000)
-            if (inIdx >= 0) {
-                val inBuf = codec.getInputBuffer(inIdx)!!
-                inBuf.clear()
-                val len = minOf(n, inBuf.capacity())
-                inBuf.put(chunk, 0, len)
-                codec.queueInputBuffer(inIdx, 0, len, ptsUs, 0)
+            val wallNs = clock.pts(readEnd - frames * 1_000_000_000L / quality.sampleRate)
+            if (wallNs == null) { anchorUs = -1; continue }   // pausado: descarta e reancora na retomada
+            val wallUs = wallNs / 1000
+            var ptsUs = if (anchorUs < 0) -1L else anchorUs + framesSinceAnchor * 1_000_000L / quality.sampleRate
+            // Reancora no início, após pausa ou se a contagem divergir do relógio (> 80 ms = perda no driver)
+            if (ptsUs < 0 || kotlin.math.abs(ptsUs - wallUs) > 80_000) {
+                anchorUs = max(wallUs, lastPtsUs + 1)
+                framesSinceAnchor = 0
+                ptsUs = anchorUs
             }
-            drain(info, false)
+            framesSinceAnchor += frames
+            if (!queuePcm(chunk, n, ptsUs, bytesPerFrame)) break
+            lastPtsUs = ptsUs + frames * 1_000_000L / quality.sampleRate
         }
-        val inIdx = codec.dequeueInputBuffer(50_000)
-        if (inIdx >= 0) codec.queueInputBuffer(inIdx, 0, 0, max(0, lastPtsUs + 1), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-        drain(info, true)
+        // fim de stream
+        while (true) {
+            val idx = try { codec.dequeueInputBuffer(20_000) } catch (_: Exception) { return }
+            if (idx >= 0) {
+                codec.queueInputBuffer(idx, 0, 0, max(0, lastPtsUs), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                return
+            }
+        }
     }
 
-    private fun drain(info: MediaCodec.BufferInfo, untilEos: Boolean) {
-        val deadline = System.currentTimeMillis() + 1500
+    /** Entrega todo o bloco ao codec (sem descartar), dividindo se o buffer de entrada for menor. */
+    private fun queuePcm(data: ByteArray, size: Int, ptsUs: Long, bytesPerFrame: Int): Boolean {
+        var off = 0
+        while (off < size) {
+            val idx = try { codec.dequeueInputBuffer(20_000) } catch (_: Exception) { return false }
+            if (idx < 0) { if (!running && off == 0) return true; continue }
+            val buf = codec.getInputBuffer(idx)!!
+            buf.clear()
+            val len = minOf(size - off, buf.capacity() / bytesPerFrame * bytesPerFrame)
+            buf.put(data, off, len)
+            val pts = ptsUs + (off / bytesPerFrame).toLong() * 1_000_000L / quality.sampleRate
+            codec.queueInputBuffer(idx, 0, len, pts, 0)
+            off += len
+        }
+        return true
+    }
+
+    private fun drainLoop() {
+        val info = MediaCodec.BufferInfo()
         while (true) {
-            val idx = codec.dequeueOutputBuffer(info, if (untilEos) 10_000 else 0)
+            val idx = try { codec.dequeueOutputBuffer(info, 20_000) } catch (e: Exception) { Log.w(TAG, "audio drain: ${e.message}"); return }
             when {
                 idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                     sinks.forEachIndexed { i, s -> tracks[i] = s.addTrack(codec.outputFormat) }
@@ -283,37 +366,65 @@ class AudioEncoder(
                     codec.releaseOutputBuffer(idx, false)
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return
                 }
-                else -> if (!untilEos || System.currentTimeMillis() > deadline) return
             }
         }
     }
 
     fun stop() {
         running = false
-        thread.join(3000)
+        captureThread.join(3000)
+        drainThread.join(3000)
         try { record.stop() } catch (_: Exception) {}
+        effects.forEach { try { it.release() } catch (_: Exception) {} }
         record.release()
         try { codec.stop() } catch (_: Exception) {}
         codec.release()
     }
 
+    /**
+     * Direção (MicrophoneDirection) e "zoom de áudio" (-1 = aberto … 1 = estreito) preferidos.
+     * Android 10+; retorna false se o aparelho não aplicou.
+     */
+    fun setMicFocus(direction: Int, field: Float): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        return try {
+            val d = record.setPreferredMicrophoneDirection(direction)
+            val f = record.setPreferredMicrophoneFieldDimension(field.coerceIn(-1f, 1f))
+            Log.i(TAG, "mic focus dir=$direction field=$field -> $d/$f")
+            d && f
+        } catch (e: Exception) { Log.w(TAG, "mic focus: ${e.message}"); false }
+    }
+
     companion object {
+        /** Entradas úteis para gravação (exclui telefonia, submix e loopback). */
         fun inputDevices(context: Context): List<AudioDeviceInfo> {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            return am.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+            val useful = setOf(
+                AudioDeviceInfo.TYPE_BUILTIN_MIC, AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE,
+                AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_LINE_ANALOG,
+                AudioDeviceInfo.TYPE_LINE_DIGITAL
+            )
+            return am.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { it.type in useful }
         }
 
         fun deviceLabel(d: AudioDeviceInfo): String {
-            val type = when (d.type) {
-                AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfone interno"
+            if (d.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                val addr = if (Build.VERSION.SDK_INT >= 28) d.address else ""
+                return when (addr.lowercase()) {
+                    "bottom" -> "Inferior"
+                    "back" -> "Traseiro"
+                    "both" -> "2 mics (estéreo)"
+                    "top" -> "Superior"
+                    else -> if (addr.isNotBlank()) "Interno ($addr)" else "Interno"
+                }
+            }
+            return when (d.type) {
                 AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Fone com fio"
                 AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB"
                 AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
-                AudioDeviceInfo.TYPE_TELEPHONY -> "Telefonia"
+                AudioDeviceInfo.TYPE_LINE_ANALOG, AudioDeviceInfo.TYPE_LINE_DIGITAL -> "Linha"
                 else -> "Entrada ${d.type}"
             }
-            val addr = if (android.os.Build.VERSION.SDK_INT >= 28 && d.address.isNotBlank()) " (${d.address})" else ""
-            return "$type$addr"
         }
     }
 }

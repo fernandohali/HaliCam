@@ -49,6 +49,7 @@ class CameraCaps(val id: String, chars: CameraCharacteristics) {
     val hasStabilization: Boolean get() = hasVideoStabilization || hasOis
     val maxAfRegions: Int = chars.get(CONTROL_MAX_REGIONS_AF) ?: 0
     val maxAeRegions: Int = chars.get(CONTROL_MAX_REGIONS_AE) ?: 0
+    val antibandingModes: IntArray = chars.get(CONTROL_AE_AVAILABLE_ANTIBANDING_MODES) ?: IntArray(0)
 
     val facingLabel: String get() = if (isFront) "Frontal" else if (isBack) "Traseira" else "Externa"
 
